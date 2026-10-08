@@ -1,40 +1,76 @@
 // Provider: Gemini (free tier) when GEMINI_API_KEY is set, otherwise Anthropic.
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-2.5-flash';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
 let anthropic;
 
+// User-facing AI failures: expose the message instead of the generic 500 text.
 export class AIError extends Error {
   constructor(message) {
     super(message);
     this.status = 502;
+    this.expose = true;
   }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const REQUEST_TIMEOUT_MS = 30000;
+const RETRY_DEADLINE_MS = 45000;
 
-async function callGemini(system, user, maxTokens) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+async function callGeminiOnce(model, system, user, maxTokens) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const body = JSON.stringify({
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: 'user', parts: [{ text: user }] }],
-    // Extra headroom: some Gemini models spend output tokens on internal thinking
-    generationConfig: { responseMimeType: 'application/json', maxOutputTokens: maxTokens + 4000, temperature: 0.7 },
+    // Small headroom over what the prompt needs: long limits slow generation down
+    generationConfig: { responseMimeType: 'application/json', maxOutputTokens: maxTokens + 800, temperature: 0.7 },
   });
-  for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, {
+  let res;
+  try {
+    res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
       body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
-    // Free tier is rate limited: wait and retry once on 429/503
-    if ((res.status === 429 || res.status === 503) && attempt < 1) {
-      await sleep(4000);
-      continue;
-    }
-    if (!res.ok) throw new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    const data = await res.json();
-    return (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('');
+  } catch (err) {
+    const netErr = new Error(`Gemini network error: ${err.message}`);
+    netErr.status = 0; // retriable
+    throw netErr;
   }
+  if (!res.ok) {
+    const err = new Error(`Gemini ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
+  }
+  const data = await res.json();
+  const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('');
+  if (!text) {
+    const err = new Error('Gemini returned an empty response');
+    err.status = 0; // retriable
+    throw err;
+  }
+  return text;
+}
+
+// Free tier spikes 429/503 often: retry with backoff, then fall back to a second model.
+async function callGemini(system, user, maxTokens) {
+  const models = [...new Set([GEMINI_MODEL, GEMINI_FALLBACK_MODEL])];
+  const start = Date.now();
+  let lastErr;
+  for (const model of models) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await callGeminiOnce(model, system, user, maxTokens);
+      } catch (err) {
+        lastErr = err;
+        const retriable = !err.status || err.status === 429 || err.status === 503 || err.status >= 500;
+        if (!retriable || attempt >= 2 || Date.now() - start > RETRY_DEADLINE_MS) break;
+        await sleep(1200 * 2 ** attempt);
+      }
+    }
+  }
+  throw lastErr;
 }
 
 async function callAnthropic(system, user, maxTokens) {
@@ -56,10 +92,10 @@ async function askJSON(system, user, maxTokens = 2000) {
     text = process.env.GEMINI_API_KEY ? await callGemini(sys, user, maxTokens) : await callAnthropic(sys, user, maxTokens);
   } catch (err) {
     console.error('AI request failed:', err.message);
-    const limited = /429/.test(err.message);
+    const busy = /429|503/.test(err.message);
     throw new AIError(
-      limited
-        ? 'The free AI limit was reached. Wait a minute and try again.'
+      busy
+        ? 'The AI is overloaded right now. Your answer was not lost — please submit it again in a few seconds.'
         : 'The AI service is unavailable right now. Check your API key and try again.'
     );
   }

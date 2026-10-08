@@ -103,6 +103,7 @@ export default function Session() {
             <span className="muted small">{text.length}/4000</span>
             <button className="btn" disabled={busy || text.trim().length < 2}>{busy ? 'Scoring your answer…' : 'Submit answer'}</button>
           </div>
+          {busy && <p className="pending" role="status">Scoring with AI — usually takes a few seconds…</p>}
           {error && <p className="error" role="alert">{error}</p>}
         </form>
       ) : (
